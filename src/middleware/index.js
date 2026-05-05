@@ -2,13 +2,13 @@ import Ajv from 'ajv';
 import addFormats from 'ajv-formats';
 import crypto from 'node:crypto';
 import config from '../config/index.js';
-import { AuthError, ValidationError, TimeoutError } from '../errors/index.js';
+import { AuthError, ValidationError, TimeoutError, RateLimitError } from '../errors/index.js';
 
 const ajv = new Ajv({ allErrors: true, removeAdditional: 'all' });
 addFormats(ajv);
 
 export function authMiddleware(req, res, next) {
-  const apiKey = req.headers['x-api-key'] || req.query.api_key;
+  const apiKey = req.headers['x-api-key'];
   if (!apiKey || apiKey !== config.apiKey) {
     throw new AuthError('Invalid or missing API key');
   }
@@ -109,6 +109,21 @@ export function validationMiddleware(schema) {
         message: e.message
       }));
       throw new ValidationError('Request validation failed', details);
+    }
+    next();
+  };
+}
+
+export function queryValidationMiddleware(schema) {
+  const validate = ajv.compile(schema);
+  return (req, res, next) => {
+    const valid = validate(req.query);
+    if (!valid) {
+      const details = validate.errors.map(e => ({
+        field: e.instancePath || e.schemaPath,
+        message: e.message
+      }));
+      throw new ValidationError('Query parameter validation failed', details);
     }
     next();
   };

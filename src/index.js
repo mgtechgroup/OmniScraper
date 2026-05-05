@@ -4,7 +4,7 @@ import cors from 'cors';
 import pinoHttp from 'pino-http';
 import { rateLimit } from 'express-rate-limit';
 import config from './config/index.js';
-import { authMiddleware, requestLogger, errorHandler, timeoutMiddleware, rateLimitMiddleware } from './middleware/index.js';
+import { authMiddleware, requestLogger, errorHandler, timeoutMiddleware, rateLimitMiddleware, validationMiddleware, queryValidationMiddleware } from './middleware/index.js';
 import logger, { createRequestLogger } from './logger/index.js';
 import { PluginRegistry } from './plugins/registry.js';
 import IMDBPlugin from './plugins/imdb.js';
@@ -13,9 +13,73 @@ import TorrentPlugin from './plugins/torrent.js';
 import MusicPlugin from './plugins/music.js';
 import SearchPlugin from './plugins/search.js';
 import RSSPlugin from './plugins/rss.js';
+import StremioPlugin from './plugins/stremio.js';
 import CacheService from './services/cache.js';
 import SchedulerService from './services/scheduler.js';
 import { AppError, ScrapingError, RateLimitError, AuthError, ValidationError, NotFoundError, ServiceUnavailableError, TimeoutError, CircuitBreakerError } from './errors/index.js';
+
+const app = express();
+const requestLoggerInstance = createRequestLogger();
+
+// Query parameter schemas
+const imdbTopQuerySchema = {
+  type: 'object',
+  properties: {
+    limit: { type: 'string', pattern: '^[0-9]+$', maximum: 100, minimum: 1 }
+  },
+  additionalProperties: false
+};
+
+const searchQuerySchema = {
+  type: 'object',
+  properties: {
+    q: { type: 'string', minLength: 1, maxLength: 200 },
+    type: { type: 'string', enum: ['movie', 'tv', 'music', 'all'] },
+    limit: { type: 'string', pattern: '^[0-9]+$' },
+    offset: { type: 'string', pattern: '^[0-9]+$' }
+  },
+  required: ['q'],
+  additionalProperties: false
+};
+
+const imdbSearchQuerySchema = {
+  type: 'object',
+  properties: {
+    q: { type: 'string', minLength: 1, maxLength: 200 }
+  },
+  required: ['q'],
+  additionalProperties: false
+};
+
+const torrentQuerySchema = {
+  type: 'object',
+  properties: {
+    magnet: { type: 'string', pattern: '^magnet:\\?' }
+  },
+  required: ['magnet'],
+  additionalProperties: false
+};
+
+// Body schemas
+const universalScrapeSchema = {
+  type: 'object',
+  properties: {
+    scraper: { type: 'string', minLength: 1, maxLength: 50 },
+    url: { type: 'string', format: 'uri', maxLength: 2048 }
+  },
+  required: ['scraper', 'url'],
+  additionalProperties: false
+};
+
+// Bounds checking helper
+function parseLimitOffset(limitStr, offsetStr) {
+  const limit = parseInt(limitStr) || 50;
+  const offset = parseInt(offsetStr) || 0;
+  return {
+    limit: Math.min(Math.max(limit, 1), 100),
+    offset: Math.max(offset, 0)
+  };
+}
 
 const app = express();
 const requestLoggerInstance = createRequestLogger();
@@ -82,6 +146,13 @@ async function initializePlugins() {
     await registry.start('rss');
   }
 
+  if (config.featureFlags.enableStremio) {
+    const stremio = new StremioPlugin();
+    await stremio.init();
+    registry.register(stremio.manifest, stremio);
+    await registry.start('stremio');
+  }
+
   scheduler.setupDefaultJobs(registry, cache);
 }
 
@@ -92,9 +163,9 @@ app.get('/health/ready', (_req, res) => {
 });
 app.get('/health/live', (_req, res) => res.json({ status: 'alive' }));
 
-app.get('/api/v1/scrape/imdb/top', authMiddleware, timeoutMiddleware(config.timeouts.scraping), async (req, res, next) => {
+app.get('/api/v1/scrape/imdb/top', authMiddleware, queryValidationMiddleware(imdbTopQuerySchema), timeoutMiddleware(config.timeouts.scraping), async (req, res, next) => {
   try {
-    const limit = parseInt(req.query.limit) || 50;
+    const limit = Math.min(parseInt(req.query.limit) || 50, 100);
     const data = await registry.get('imdb').getTopMovies(limit);
     res.json({ data });
   } catch (err) { next(err); }
@@ -107,16 +178,14 @@ app.get('/api/v1/scrape/imdb/movie/:id', authMiddleware, timeoutMiddleware(confi
   } catch (err) { next(err); }
 });
 
-app.get('/api/v1/scrape/imdb/search', authMiddleware, timeoutMiddleware(config.timeouts.scraping), async (req, res, next) => {
+app.get('/api/v1/scrape/imdb/search', authMiddleware, queryValidationMiddleware(imdbSearchQuerySchema), timeoutMiddleware(config.timeouts.scraping), async (req, res, next) => {
   try {
-    const query = req.query.q;
-    if (!query) throw new ValidationError('Query parameter q is required');
-    const data = await registry.get('imdb').searchMovies(query);
+    const data = await registry.get('imdb').searchMovies(req.query.q);
     res.json({ data });
   } catch (err) { next(err); }
 });
 
-app.post('/api/v1/scrape/universal/run', authMiddleware, timeoutMiddleware(config.timeouts.scraping), async (req, res, next) => {
+app.post('/api/v1/scrape/universal/run', authMiddleware, validationMiddleware(universalScrapeSchema), timeoutMiddleware(config.timeouts.scraping), async (req, res, next) => {
   try {
     const { scraper, url } = req.body;
     const data = await registry.get('universal').runScraper(scraper, url);
@@ -124,7 +193,7 @@ app.post('/api/v1/scrape/universal/run', authMiddleware, timeoutMiddleware(confi
   } catch (err) { next(err); }
 });
 
-app.get('/api/v1/torrent/info', authMiddleware, timeoutMiddleware(config.timeouts.torrent), async (req, res, next) => {
+app.get('/api/v1/torrent/info', authMiddleware, queryValidationMiddleware(torrentQuerySchema), timeoutMiddleware(config.timeouts.torrent), async (req, res, next) => {
   try {
     const { magnet } = req.query;
     const data = await registry.get('torrent').getTorrentInfo(magnet);
@@ -146,10 +215,11 @@ app.get('/api/v1/music/analytics', authMiddleware, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-app.get('/api/v1/search', authMiddleware, async (req, res, next) => {
+app.get('/api/v1/search', authMiddleware, queryValidationMiddleware(searchQuerySchema), async (req, res, next) => {
   try {
     const { q, type, limit, offset } = req.query;
-    const data = await registry.get('search').search(q, { type, limit: parseInt(limit) || 50, offset: parseInt(offset) || 0 });
+    const { limit: safeLimit, offset: safeOffset } = parseLimitOffset(limit, offset);
+    const data = await registry.get('search').search(q, { type, limit: safeLimit, offset: safeOffset });
     res.json({ data });
   } catch (err) { next(err); }
 });
@@ -159,6 +229,45 @@ app.get('/api/v1/rss/:source', authMiddleware, async (req, res, next) => {
     const xml = await registry.get('rss').getFeed(req.params.source, req.params.category);
     res.set('Content-Type', 'application/rss+xml');
     res.send(xml);
+  } catch (err) { next(err); }
+});
+
+app.get('/api/v1/stremio/catalog/:type/:id', authMiddleware, timeoutMiddleware(config.timeouts.stremio), async (req, res, next) => {
+  try {
+    const { type, id } = req.params;
+    const data = await registry.getStremio().getCatalog(type, id);
+    res.json({ data });
+  } catch (err) { next(err); }
+});
+
+app.get('/api/v1/stremio/stream/:type/:id', authMiddleware, timeoutMiddleware(config.timeouts.stremio), async (req, res, next) => {
+  try {
+    const { type, id } = req.params;
+    const data = await registry.getStremio().getStreams(type, id);
+    res.json({ data });
+  } catch (err) { next(err); }
+});
+
+app.get('/api/v1/stremio/meta/:type/:id', authMiddleware, timeoutMiddleware(config.timeouts.stremio), async (req, res, next) => {
+  try {
+    const { type, id } = req.params;
+    const data = await registry.getStremio().getMeta(type, id);
+    res.json({ data });
+  } catch (err) { next(err); }
+});
+
+app.get('/api/v1/stremio/addons', authMiddleware, async (req, res, next) => {
+  try {
+    const data = await registry.getStremio().getAddons();
+    res.json({ data });
+  } catch (err) { next(err); }
+});
+
+app.post('/api/v1/stremio/search', authMiddleware, express.json(), async (req, res, next) => {
+  try {
+    const { query, type } = req.body;
+    const data = await registry.getStremio().search(query, type);
+    res.json({ data });
   } catch (err) { next(err); }
 });
 

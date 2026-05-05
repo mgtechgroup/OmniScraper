@@ -72,6 +72,10 @@ export class PluginRegistry extends EventEmitter {
     return plugin ? plugin.instance : null;
   }
 
+  getStremio() {
+    return this.get('stremio');
+  }
+
   getAll() {
     return Array.from(this.plugins.entries()).map(([name, plugin]) => ({
       name,
