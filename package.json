@@ -33,7 +33,7 @@
     "rss": "^1.2.2",
     "spotify-web-api-node": "^5.0.2",
     "toad-scheduler": "^2.1.0",
-    "uuid": "^9.0.0",
+    "uuid": "^14.0.0",
     "webtorrent": "^2.3.0",
     "yaml": "^2.8.4"
   },
